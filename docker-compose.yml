@@ -1,0 +1,168 @@
+# ==============================================================================
+# Docker Compose — Redmine Integration Service (Full Stack)
+# ==============================================================================
+# One-click local environment:
+#   docker compose up --build
+#
+# This brings up:
+#   1. PostgreSQL          — Redmine's database
+#   2. Redmine             — Official Redmine instance (primary)
+#   3. Redmine Support     — Second Redmine instance (support workflows)
+#   4. redmine-integration — This Spring Boot microservice
+#
+# Ports exposed on localhost:
+#   http://localhost:3000  → Primary Redmine UI
+#   http://localhost:3001  → Support Redmine UI
+#   http://localhost:8080  → Redmine Integration Service (Swagger UI)
+#
+# First-time setup:
+#   1. Copy the environment template:  cp .env.example .env
+#   2. Build the JAR:                  ./mvnw clean package -DskipTests
+#   3. Start everything:               docker compose up --build
+#   4. Log into Redmine at http://localhost:3000 (admin / admin)
+#   5. Go to Administration → Settings → API → Enable REST web service
+#   6. Copy your API key and test: http://localhost:8080/swagger-ui.html
+# ==============================================================================
+
+services:
+
+  # ─────────────────────────────────────────────
+  # PostgreSQL Database (shared by both Redmine instances)
+  # ─────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: redmine-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: redmine
+      POSTGRES_PASSWORD: redmine_secret
+      POSTGRES_DB: redmine_primary
+    volumes:
+      - redmine_db_data:/var/lib/postgresql/data
+      - ./docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U redmine -d redmine_primary"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - redmine-net
+
+  # ─────────────────────────────────────────────
+  # Primary Redmine Instance
+  # ─────────────────────────────────────────────
+  redmine:
+    image: redmine:5.1-alpine
+    container_name: redmine-primary
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      REDMINE_DB_POSTGRES: db
+      REDMINE_DB_PORT: 5432
+      REDMINE_DB_USERNAME: redmine
+      REDMINE_DB_PASSWORD: redmine_secret
+      REDMINE_DB_DATABASE: redmine_primary
+      REDMINE_SECRET_KEY_BASE: primary_secret_key_base_change_in_production
+    volumes:
+      - redmine_primary_files:/usr/src/redmine/files
+      - redmine_primary_plugins:/usr/src/redmine/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - redmine-net
+
+  # ─────────────────────────────────────────────
+  # Support Redmine Instance (second Redmine)
+  # ─────────────────────────────────────────────
+  redmine-support:
+    image: redmine:5.1-alpine
+    container_name: redmine-support
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "3001:3000"
+    environment:
+      REDMINE_DB_POSTGRES: db
+      REDMINE_DB_PORT: 5432
+      REDMINE_DB_USERNAME: redmine
+      REDMINE_DB_PASSWORD: redmine_secret
+      REDMINE_DB_DATABASE: redmine_support
+      REDMINE_SECRET_KEY_BASE: support_secret_key_base_change_in_production
+    volumes:
+      - redmine_support_files:/usr/src/redmine/files
+      - redmine_support_plugins:/usr/src/redmine/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - redmine-net
+
+  # ─────────────────────────────────────────────
+  # Redmine Integration Service (this project)
+  # ─────────────────────────────────────────────
+  redmine-integration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: picc-pc-redmine-integration:latest
+    container_name: redmine-integration
+    restart: unless-stopped
+    depends_on:
+      redmine:
+        condition: service_healthy
+      redmine-support:
+        condition: service_healthy
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    environment:
+      - SERVER_PORT=${SERVER_PORT:-8080}
+      - SPRING_PROFILES_ACTIVE=${SPRING_PROFILES_ACTIVE:-main}
+      - FEIGN_NAME=${FEIGN_NAME:-redmine-client}
+      - FEIGN_URL=${FEIGN_URL:-http://redmine:3000}
+      - FEIGN_SUPPORT_NAME=${FEIGN_SUPPORT_NAME:-redmine-support-client}
+      - FEIGN_SUPPORT_URL=${FEIGN_SUPPORT_URL:-http://redmine-support:3000}
+      - REDMINE_ROLE=${REDMINE_ROLE:-4}
+      - CONFIG_SERVER_URL=${CONFIG_SERVER_URL:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/v3/api-docs || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    networks:
+      - redmine-net
+
+# ─────────────────────────────────────────────
+# Named Volumes
+# ─────────────────────────────────────────────
+volumes:
+  redmine_db_data:
+    driver: local
+  redmine_primary_files:
+    driver: local
+  redmine_primary_plugins:
+    driver: local
+  redmine_support_files:
+    driver: local
+  redmine_support_plugins:
+    driver: local
+
+# ─────────────────────────────────────────────
+# Internal Network
+# ─────────────────────────────────────────────
+networks:
+  redmine-net:
+    driver: bridge
